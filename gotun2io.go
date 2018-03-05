@@ -1,4 +1,4 @@
-package main
+package gotun2io
 
 import (
 	_ "net/http/pprof"
@@ -6,7 +6,6 @@ import (
 	"github.com/google/netstack/tcpip"
 	"github.com/google/netstack/tcpip/link/fdbased"
 	"github.com/google/netstack/tcpip/link/rawfile"
-	"github.com/google/netstack/tcpip/link/tun"
 	"github.com/google/netstack/tcpip/network/ipv4"
 	"github.com/google/netstack/tcpip/network/ipv6"
 	"github.com/google/netstack/tcpip/stack"
@@ -15,44 +14,34 @@ import (
 	"golang.org/x/net/proxy"
 	"net"
 	"fmt"
-	"os"
-	"net/http"
+	"github.com/nsecgo/water"
 )
 
-const NICID = 1
+const NICID = 666
 
-func init() {
-	log.SetFlags(log.Lshortfile | log.LstdFlags)
-}
-
-func run() {
-	if len(os.Args) != 2 {
-		log.Fatal("Usage: ", os.Args[0], " <tun-device>")
-	}
-
-	tunName := os.Args[1]
-
+func Run(socks5Addr string) {
 	// Create the stack with ip and tcp protocols, then add a tun-based NIC and address.
 	s := stack.New([]string{ipv4.ProtocolName, ipv6.ProtocolName}, []string{tcp.ProtocolName})
 
-	mtu, err := rawfile.GetMTU(tunName)
+	ifce, err := water.New(water.Config{
+		DeviceType: water.TUN,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	mtu, err := rawfile.GetMTU(ifce.Name())
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fd, err := tun.Open(tunName)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	linkID := fdbased.New(fd, mtu, nil)
+	linkID := fdbased.New(ifce.Fd, mtu, nil)
 	if err := s.CreateNIC(NICID, linkID); err != nil {
 		log.Fatal(err)
 	}
 
 	s.SetPromiscuousMode(NICID, true)
 
-	dialer, err := proxy.SOCKS5("tcp", "127.0.0.1:1080", nil, &net.Dialer{})
+	dialer, err := proxy.SOCKS5("tcp", socks5Addr, nil, &net.Dialer{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -67,11 +56,11 @@ func run() {
 		transportEndpointID := r.ID()
 		r.Complete(false)
 
-		conn, err := dialer.Dial("tcp", fmt.Sprintf("%v:%d", transportEndpointID.LocalAddress, transportEndpointID.LocalPort))
+		socksConn, err := dialer.Dial("tcp", fmt.Sprintf("%v:%d", transportEndpointID.LocalAddress, transportEndpointID.LocalPort))
 		if err != nil {
 			log.Fatal(err)
 		}
-		socksConn := conn.(*net.TCPConn)
+		socksConn.(*net.TCPConn).SetNoDelay(false)
 
 		// Create wait queue entry that notifies a channel.
 		waitEntry, notifyCh := waiter.NewChannelEntry(nil)
@@ -79,7 +68,7 @@ func run() {
 		defer wq.EventUnregister(&waitEntry)
 
 		go func() {
-			buf := make([]byte, 1500)
+			buf := make([]byte, mtu)
 			for {
 				n, err := socksConn.Read(buf)
 				if err != nil {
@@ -101,8 +90,4 @@ func run() {
 		}
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
-}
-func main() {
-	go run()
-	http.ListenAndServe(":9000", nil)
 }
