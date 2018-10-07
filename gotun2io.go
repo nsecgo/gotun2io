@@ -1,91 +1,89 @@
 package gotun2io
 
 import (
-	"log"
-	"github.com/google/netstack/tcpip"
+	"github.com/google/netstack/tcpip/adapters/gonet"
 	"github.com/google/netstack/tcpip/link/fdbased"
 	"github.com/google/netstack/tcpip/link/rawfile"
+	"github.com/google/netstack/tcpip/network/arp"
 	"github.com/google/netstack/tcpip/network/ipv4"
 	"github.com/google/netstack/tcpip/network/ipv6"
 	"github.com/google/netstack/tcpip/stack"
 	"github.com/google/netstack/tcpip/transport/tcp"
 	"github.com/google/netstack/waiter"
-	"fmt"
 	"github.com/nsecgo/water"
 	"io"
+	"log"
+	"math/rand"
+	"net"
+	"strconv"
+	"time"
 )
-
-type Dialer interface {
-	Dial(network, address string) (io.ReadWriteCloser, error)
-}
 
 const NICID = 666
 
-// No block run.
-func Run(dialer Dialer) {
-	// Create the stack with ip and tcp protocols, then add a tun-based NIC and address.
-	s := stack.New([]string{ipv4.ProtocolName, ipv6.ProtocolName}, []string{tcp.ProtocolName})
-
-	ifce, err := water.New(water.Config{
+// Non-Blocking run.
+func Run(dial func(network, address string) (io.ReadWriteCloser, error)) {
+	rand.Seed(time.Now().UnixNano())
+	// Create the stack with ip and tcp protocols, then add a tun-based
+	// NIC and address.
+	s := stack.New([]string{ipv4.ProtocolName, ipv6.ProtocolName, arp.ProtocolName}, []string{tcp.ProtocolName}, stack.Options{})
+	ifc, err := water.New(water.Config{
 		DeviceType: water.TUN,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	mtu, err := rawfile.GetMTU(ifce.Name())
+	mtu, err := rawfile.GetMTU(ifc.Name())
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	linkID := fdbased.New(ifce.Fd, mtu, nil)
+	linkID := fdbased.New(&fdbased.Options{
+		FD:  ifc.Fd,
+		MTU: mtu,
+	})
 	if err := s.CreateNIC(NICID, linkID); err != nil {
 		log.Fatal(err)
 	}
-
+	//addr := tcpip.Address(net.ParseIP("192.168.2.100").To4())
+	//if err := s.AddAddress(NICID, ipv4.ProtocolNumber, addr); err != nil {
+	//	log.Fatal(err)
+	//}
+	//if err := s.AddAddress(NICID, arp.ProtocolNumber, arp.ProtocolAddress); err != nil {
+	//	log.Fatal(err)
+	//}
+	//// Add default route.
+	//s.SetRouteTable([]tcpip.Route{
+	//	{
+	//		Destination: tcpip.Address(strings.Repeat("\x00", len(addr))),
+	//		Mask:        tcpip.AddressMask(strings.Repeat("\x00", len(addr))),
+	//		Gateway:     "",
+	//		NIC:         NICID,
+	//	},
+	//})
 	s.SetPromiscuousMode(NICID, true)
 
 	var wq waiter.Queue
 	fwd := tcp.NewForwarder(s, 0, 10, func(r *tcp.ForwarderRequest) {
 		ep, er := r.CreateEndpoint(&wq)
 		if er != nil {
-			log.Fatal(er)
+			transportEndpointID := r.ID()
+			log.Println(er, net.JoinHostPort(transportEndpointID.LocalAddress.String(), strconv.Itoa(int(transportEndpointID.LocalPort))))
+			r.Complete(false)
+			return
 		}
 		defer ep.Close()
 		transportEndpointID := r.ID()
 		r.Complete(false)
 
-		conn, err := dialer.Dial("tcp", fmt.Sprintf("%v:%d", transportEndpointID.LocalAddress, transportEndpointID.LocalPort))
+		conn, err := dial("tcp", net.JoinHostPort(transportEndpointID.LocalAddress.String(), strconv.Itoa(int(transportEndpointID.LocalPort))))
 		if err != nil {
-			log.Fatal(err)
+			log.Println(err)
+			return
 		}
 		defer conn.Close()
-
-		// Create wait queue entry that notifies a channel.
-		waitEntry, notifyCh := waiter.NewChannelEntry(nil)
-		wq.EventRegister(&waitEntry, waiter.EventIn)
-		defer wq.EventUnregister(&waitEntry)
-
-		go func() {
-			var buf = make([]byte, mtu)
-			for {
-				n, err := conn.Read(buf)
-				if err != nil {
-					return
-				}
-				ep.Write(buf[:n], nil)
-			}
-		}()
-		for {
-			v, err := ep.Read(nil)
-			if err != nil {
-				if err == tcpip.ErrWouldBlock {
-					<-notifyCh
-					continue
-				}
-				break
-			}
-			conn.Write(v)
-		}
+		fwdConn := gonet.NewConn(&wq, ep)
+		go io.Copy(fwdConn, conn)
+		io.Copy(conn, fwdConn)
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
 }
