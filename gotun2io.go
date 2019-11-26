@@ -10,11 +10,12 @@ import (
 	"github.com/google/netstack/tcpip/stack"
 	"github.com/google/netstack/tcpip/transport/tcp"
 	"github.com/google/netstack/waiter"
-	"github.com/nsecgo/water"
+	"github.com/songgao/water"
 	"io"
 	"log"
 	"math/rand"
 	"net"
+	"os"
 	"strconv"
 	"time"
 )
@@ -26,7 +27,10 @@ func Run(dial func(network, address string) (io.ReadWriteCloser, error)) {
 	rand.Seed(time.Now().UnixNano())
 	// Create the stack with ip and tcp protocols, then add a tun-based
 	// NIC and address.
-	s := stack.New([]string{ipv4.ProtocolName, ipv6.ProtocolName, arp.ProtocolName}, []string{tcp.ProtocolName}, stack.Options{})
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocol{ipv4.NewProtocol(), ipv6.NewProtocol(), arp.NewProtocol()},
+		TransportProtocols: []stack.TransportProtocol{tcp.NewProtocol()},
+	})
 	ifc, err := water.New(water.Config{
 		DeviceType: water.TUN,
 	})
@@ -37,10 +41,13 @@ func Run(dial func(network, address string) (io.ReadWriteCloser, error)) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	linkID := fdbased.New(&fdbased.Options{
-		FD:  ifc.Fd,
+	linkID, err := fdbased.New(&fdbased.Options{
+		FDs: []int{int(ifc.ReadWriteCloser.(*os.File).Fd())},
 		MTU: mtu,
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	if err := s.CreateNIC(NICID, linkID); err != nil {
 		log.Fatal(err)
 	}
